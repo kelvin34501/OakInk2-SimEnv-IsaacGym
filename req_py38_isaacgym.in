@@ -1,0 +1,31 @@
+# basic
+tqdm
+numpy<1.24.0
+pillow
+imageio
+ninja
+pyyaml>=5.3.1
+scipy>=1.5.0
+tensorboard>=2.2.1
+pyglet<2 # required by trimesh scene
+trimesh[easy]
+jinja2
+pymeshlab
+# sim
+pybullet
+mujoco
+pytorch-kinematics
+arm-pytorch-utilities
+# issac
+-e ./thirdparty/isaac_gym/isaacgym/python
+-e ./thirdparty/IsaacGymEnvs
+# torch
+--extra-index-url https://download.pytorch.org/whl/cu121
+typing_extensions>=4.8.0
+torch==2.3.1+cu121
+torchvision==0.18.1
+# layer
+-e ./thirdparty/chumpy
+-e ./thirdparty/manotorch
+# package
+-e .

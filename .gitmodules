@@ -1,0 +1,18 @@
+[submodule "IsaacGymEnvs"]
+	path = thirdparty/IsaacGymEnvs
+	url = https://github.com/NVIDIA-Omniverse/IsaacGymEnvs.git
+[submodule "manotorch"]
+	path = thirdparty/manotorch
+	url = https://github.com/lixiny/manotorch.git
+[submodule "chumpy"]
+	path = thirdparty/chumpy
+	url = https://github.com/mattloper/chumpy.git
+[submodule "thirdparty/IsaacGymEnvs"]
+	path = thirdparty/IsaacGymEnvs
+	url = https://github.com/NVIDIA-Omniverse/IsaacGymEnvs.git
+[submodule "thirdparty/manotorch"]
+	path = thirdparty/manotorch
+	url = https://github.com/lixiny/manotorch.git
+[submodule "thirdparty/chumpy"]
+	path = thirdparty/chumpy
+	url = https://github.com/mattloper/chumpy.git

@@ -1,0 +1,11 @@
+-r req_py38_isaacgym.txt
+# dev
+jupyter
+paramiko
+black
+flake8
+mypy
+isort
+rope
+pytest
+pylint
