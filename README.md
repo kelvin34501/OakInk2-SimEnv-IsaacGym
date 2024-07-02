@@ -1,5 +1,9 @@
 # OakInk2-SimEnv-IsaacGym
 
+<div align="center">
+  <img src="./doc/set_pose.gif" alt="Example">
+</div>
+
 1. Setup asset files.
 
     Download tarballs from [huggingface](https://huggingface.co/kelvin34501/OakInk2-SimEnv-IsaacGym-Asset/blob/main/oi2_dev.tar.xz). Extract the tarball under `asset/`.
