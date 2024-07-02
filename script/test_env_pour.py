@@ -45,7 +45,7 @@ def main():
     num_envs = 100
     random.seed(0)
 
-    with open("asset/oi2_dev/pour/task_list_rh.json", "r") as ifs:
+    with open("asset/oi2_dev/pour/task_list_rh__train.json", "r") as ifs:
         code_list = json.load(ifs)
     task_info_list = []
     for code in code_list:
