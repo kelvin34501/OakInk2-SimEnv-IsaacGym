@@ -1,7 +1,7 @@
 # OakInk2-SimEnv-IsaacGym
 
 <div align="center">
-  <img src="./doc/set_pose.gif" alt="Example">
+  <img src="./doc/set_pose.gif" alt="Demo Trajectory Example">
 </div>
 
 1. Setup asset files.
@@ -77,4 +77,4 @@
     python -m script.test_env_pour
     ```
 
-    If you want to use reinforcement learning algorithms in this toolkit, there is an example in `src/dyn_mf/env/oi2_dev.py` to set the reward and observation functions.
+    If you want to use reinforcement learning algorithms in this toolkit, there is an example in `src/dyn_mf/env/oi2_dev.py` to set the reward and observation functions. The observation and reward functions set in the current example file are both blank placeholders to be filled.
