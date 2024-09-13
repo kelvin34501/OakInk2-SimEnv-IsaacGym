@@ -354,8 +354,8 @@ class OakInk2DevAssetLoader(AssetLoader):
                     cached_obj_aux_def_item[_info_item["id"]] = self._to_def(_info_item)
                 eval_item["num_fluid_particle"] = len(_fluid_info_list)
 
+            obj_dst_id = task_meta["tool_dst"]
             if self.enable_evaluation:
-                obj_dst_id = task_meta["tool_dst"]
                 obj_dst_transf_init = task_ref_raw["obj_def_info"][obj_dst_id]["target"]
                 obj_dst_info = {
                     "id": obj_dst_id,
