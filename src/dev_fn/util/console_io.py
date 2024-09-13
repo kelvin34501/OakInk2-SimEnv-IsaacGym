@@ -54,3 +54,10 @@ def filter_warnings(cata=Warning, module=""):
 
 pprint = functools.partial(pprint_module.pprint, sort_dicts=False, width=120, compact=True)
 pformat = functools.partial(pprint_module.pformat, sort_dicts=False, width=120, compact=True)
+
+
+def set_np_formatting():
+    import numpy as np
+    np.set_printoptions(edgeitems=30, infstr='inf',
+                        linewidth=4000, nanstr='nan', precision=2,
+                        suppress=False, threshold=10000, formatter=None)

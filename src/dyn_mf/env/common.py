@@ -27,6 +27,10 @@ class EnvCallbackContext(object):
     def detach_env(self):
         self.env = None
 
+    # reset_idx
+    def reset_idx(self, env_id_to_reset: torch.Tensor):
+        pass
+
     # action
     def apply_action(self, action: torch.Tensor, env_id_to_reset: torch.Tensor):
         pass

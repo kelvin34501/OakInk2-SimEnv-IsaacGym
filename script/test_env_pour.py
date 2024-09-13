@@ -55,8 +55,8 @@ def main():
                 "code": code,
             }
         )
-    asset_loader = OakInk2DevAssetLoader(num_env=num_envs, task_info_list=task_info_list)
-    env_callback_ctx = OakInk2DevEnvCallbackContext(num_env=num_envs, device=device, dtype=torch.float32)
+    asset_loader = OakInk2DevAssetLoader(num_env=num_envs, task_info_list=task_info_list, enable_evaluation=True)
+    env_callback_ctx = OakInk2DevEnvCallbackContext(num_env=num_envs, device=device, dtype=torch.float32, enable_evaluation=True)
 
     env_cfg = dict(
         isaacgym_cfg=dict(
@@ -67,7 +67,8 @@ def main():
         ),
     )
     env = EnvGeneral(
-        isaacgym_cfg=env_cfg["isaacgym_cfg"],
+        cfg_env=env_cfg,
+        cfg_isaacgym=env_cfg["isaacgym_cfg"],
         rl_device=device,
         sim_device=device,
         graphics_device_id=0,  # on platform10 -> cuda:3 is graphics_device 0
@@ -77,13 +78,12 @@ def main():
         env_callback_ctx=env_callback_ctx,
     )
 
-    obs_dict = env.reset()
+    obs = env.reset()
     while True:
-        obs = obs_dict["obs"]
         action = torch.rand((num_envs,) + env.action_space.shape, device=device)
         # action = action * 2 - 1.0
         action[:, :] = 0.0
-        obs_dict, rew, done, info = env.step(action)
+        obs, rew, done, info = env.step(action)
 
     log.log_deinit()
 

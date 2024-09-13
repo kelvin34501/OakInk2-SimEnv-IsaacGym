@@ -139,13 +139,13 @@ requirements_dev.txt
 req_*.txt
 !req_*.example.txt
 
-# c3d data
-manual/viz/c3d_data
-
 # jupyter notebook
 *.ipynb
 
 # thirdparty/blender
 /thirdparty/isaac_gym/*
+
+# extension
+src/dev_fn/cython/triangle_hash.cpp
 
 MUJOCO_LOG.TXT

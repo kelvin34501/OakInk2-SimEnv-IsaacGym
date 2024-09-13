@@ -146,7 +146,7 @@ def deconfigure_mp_main(queue: mp.Queue):
 class Formatter(logging.Formatter):
     """Logging Formatter to add colors and count warning / errors"""
 
-    time_str = "%(asctime)s"
+    time_str = "[%(asctime)s]"
     level_str = "[%(levelname)s]"
     msg_str = "%(message)s"
     src_str = "(%(name)s @ %(filename)s:%(lineno)d)"

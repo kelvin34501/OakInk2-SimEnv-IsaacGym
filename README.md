@@ -14,6 +14,7 @@
     |--- oi2_dev
     |   |--- obj
     |   |--- obj_raw
+    |   |--- obj_interior
     |   `--- pour
     |       |--- demo_raw
     |       |--- meta

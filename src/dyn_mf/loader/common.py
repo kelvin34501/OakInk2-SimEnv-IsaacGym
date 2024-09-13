@@ -31,6 +31,17 @@ def load_box_def(
     }
 
 
+def load_sphere_def(
+    radius,
+):
+    return {
+        "geom_cata": GeomCata.SPHERE,
+        "geom_param": {
+            "radius": float(radius),
+        },
+    }
+
+
 class AssetLoader(object):
     def __call__(self):
         raise NotImplementedError()

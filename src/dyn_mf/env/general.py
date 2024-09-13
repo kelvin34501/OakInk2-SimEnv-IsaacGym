@@ -12,15 +12,13 @@ import pickle
 import logging
 from dev_fn.util.console_io import RedirectStream, pformat, pprint
 from dev_fn.transform.rotation_np import rotmat_to_quat_np, quat_to_euler_angle_np
-from dev_fn.dataset import segment
 
 with RedirectStream(), RedirectStream(sys.stderr):
     from isaacgym import gymapi, gymutil, gymtorch
-    from isaacgymenvs.tasks.base.vec_task import VecTask
-    from isaacgymenvs.utils.torch_jit_utils import to_torch
 import torch
 import itertools
 
+from . import base as env_base
 from . import const as env_const
 from . import tool as env_tool
 from ..scene import FrameConvention, GeomCata
@@ -37,6 +35,9 @@ _logger = logging.getLogger(__name__)
 
 
 def _extract_init_info(init_asset):
+    """
+    extract information used for reset
+    """
     init_info = {
         "obj_aux": [],
         "obj": [],
@@ -122,11 +123,12 @@ def _rb_count_to_index(rb_count, rb_index_map):
     return res, res_index_map
 
 
-class EnvGeneral(VecTask):
+class EnvGeneral(env_base.VecTask):
     def __init__(
         self,
         asset_loader: Callable,
-        isaacgym_cfg: dict[str, Any],
+        cfg_isaacgym: dict[str, Any],
+        cfg_env: dict[str, Any],
         rl_device: str,
         sim_device: str,
         graphics_device_id: int,
@@ -136,6 +138,8 @@ class EnvGeneral(VecTask):
         env_callback_ctx: Optional[EnvCallbackContext] = None,
         override_cfg: bool = True,
     ):
+        # env_cfg, for extra flexibility
+        self.cfg_env = cfg_env
         # asset loader
         self.asset_loader = asset_loader
         ## asset
@@ -148,9 +152,10 @@ class EnvGeneral(VecTask):
         self.env_callback_ctx = env_callback_ctx
 
         # init VecTask
-        self.debug_viz = isaacgym_cfg.get("env", {}).get("enableDebugVis", False)
+        self.debug_viz = cfg_isaacgym.get("env", {}).get("enableDebugVis", False)
         # maintainence code
-        self.cfg = isaacgym_cfg.copy()  # VecTask required
+        self.cfg = cfg_isaacgym.copy()  # VecTask required
+        self.aggregate_mode = self.cfg["env"].get("aggregateMode", 0)
         # populate self.cfg
         if override_cfg:
             use_gpu_pipeline = not (sim_device == "cpu")
@@ -168,20 +173,21 @@ class EnvGeneral(VecTask):
                 contact_offset=0.002,
                 rest_offset=0.00000,
                 bounce_threshold_velocity=0.2,
-                max_depenetration_velocity=1000,
-                friction_offset_threshold=0.008,
-                friction_correlation_distance=0.005,
-                num_position_iterations=6,
-                num_velocity_iterations=1,
-                num_threads=4,
+                max_depenetration_velocity=1000.0,
+                # friction_offset_threshold=0.01,
+                # friction_correlation_distance=0.00625,
+                num_position_iterations=8,
+                num_velocity_iterations=0,
+                num_threads=12,
                 use_gpu=use_gpu_pipeline,
-                max_gpu_contact_pairs=1000 * 1000 * 10,
+                max_gpu_contact_pairs=1000 * 1000 * 100,
                 default_buffer_size_multiplier=10,
             )
         _logger.info("env using dt %f", self.cfg["sim"]["dt"])
         max_episode_length = env_callback_ctx.timeout // (
             self.cfg["sim"]["dt"] * self.cfg["sim"]["controlFrequencyInv"]
         )
+        max_episode_length = math.ceil(max_episode_length)
         _logger.info("env max_episode_length %d", max_episode_length)
         self.cfg["env"].update(
             dict(
@@ -198,8 +204,6 @@ class EnvGeneral(VecTask):
         # attr for env creation
         ## viz
         self.hand_color = [147 / 255, 215 / 255, 160 / 255]
-        self.object_color = [90 / 255, 94 / 255, 173 / 255]
-        self.object_color_2 = [150 / 255, 150 / 255, 150 / 255]
 
         super().__init__(
             config=self.cfg,
@@ -220,6 +224,7 @@ class EnvGeneral(VecTask):
         dof_force_tensor = self.gym.acquire_dof_force_tensor(self.sim)
         rigid_body_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
         net_contact_force_tensor = self.gym.acquire_net_contact_force_tensor(self.sim)
+        force_sensor_tensor = self.gym.acquire_force_sensor_tensor(self.sim)
 
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
@@ -238,6 +243,7 @@ class EnvGeneral(VecTask):
 
         self.rigid_body_state = gymtorch.wrap_tensor(rigid_body_tensor).view(-1, 13)
         self.net_contact_force = gymtorch.wrap_tensor(net_contact_force_tensor).view(-1, 3)
+        self.force_sensor = gymtorch.wrap_tensor(force_sensor_tensor).view(-1, 6)
 
         self.total_dofs = self.gym.get_sim_dof_count(self.sim)  # total dofs
         assert self.total_dofs == sum(self.dof_count_list)
@@ -282,6 +288,70 @@ class EnvGeneral(VecTask):
         self.limit_info = {}
         asset_store_obj_aux = {}
         asset_store_obj = {}
+
+        # load agents
+        # TODO: general multi-agent
+        self.lh_enabled, self.rh_enabled = self.init_asset["lh_def"] is not None, self.init_asset["rh_def"] is not None
+        self.h_enabled = {"lh": self.lh_enabled, "rh": self.rh_enabled}
+        self.num_agents = int(self.lh_enabled) + int(self.rh_enabled)
+        asset_store_h = {}
+        for h_id in ["lh", "rh"]:
+            if not self.h_enabled[h_id]:
+                continue
+
+            h_def = f"{h_id}_def"
+            h_asset_options = gymapi.AssetOptions()
+            h_asset_options.flip_visual_attachments = False
+            h_asset_options.fix_base_link = self.init_asset[h_def]["static"]
+            h_asset_options.disable_gravity = True
+            h_asset_options.collapse_fixed_joints = False
+            h_asset_options.thickness = self.init_asset[h_def].get("thickness", 0.001)
+            if self.init_asset[h_def].get("load_context", None):
+                self.init_asset[h_def]["load_context"].handle_asset_option(h_asset_options)
+
+            geom_param_h = self.init_asset[h_def]["geom_param"]
+            asset_h = self.gym.load_asset(
+                self.sim, geom_param_h["asset_dir"], geom_param_h["asset_name"], h_asset_options
+            )
+            asset_store_h[h_id] = asset_h
+            self.meta_info[h_id] = {
+                "num_body": self.gym.get_asset_rigid_body_count(asset_h),
+                "num_shape": self.gym.get_asset_rigid_shape_count(asset_h),
+                "num_dof": self.gym.get_asset_dof_count(asset_h),
+                "num_actuator": self.gym.get_asset_actuator_count(asset_h),
+                "num_tendon": self.gym.get_asset_tendon_count(asset_h),
+            }
+
+            # tendon
+            if self.init_asset[h_def].get("load_context", None):
+                self.init_asset[h_def]["load_context"].handle_asset_tendon(self.gym, asset_h, self.meta_info[h_id])
+
+            # force sensor at fingertip
+            if self.init_asset[h_def].get("load_context", None):
+                self.init_asset[h_def]["load_context"].handle_asset_force_sensor(
+                    self.gym, asset_h, self.meta_info[h_id]
+                )
+
+            # dof actutation
+            actuated_dof_name_h = [
+                self.gym.get_asset_actuator_joint_name(asset_h, i) for i in range(self.meta_info[h_id]["num_actuator"])
+            ]
+            actuated_dof_index_h = [self.gym.find_asset_dof_index(asset_h, name) for name in actuated_dof_name_h]
+            self.meta_info[h_id]["actuated_dof_name"] = actuated_dof_name_h
+            self.meta_info[h_id]["actuated_dof_index"] = actuated_dof_index_h
+
+            # dof
+            asset_h_dof_props = self.gym.get_asset_dof_properties(asset_h)
+            self.limit_info[h_id] = {
+                "lower": np.asarray(asset_h_dof_props["lower"]).copy().astype(np.float32),
+                "upper": np.asarray(asset_h_dof_props["upper"]).copy().astype(np.float32),
+            }
+            self.limit_info[h_id]["default_pos"] = np.zeros_like(self.limit_info[h_id]["lower"])
+            self.limit_info[h_id]["default_vel"] = np.zeros_like(self.limit_info[h_id]["lower"])
+
+        _logger.info("meta_info: \n%s" % pformat(self.meta_info))
+        _logger.info("limit_info: \n%s" % pformat(self.limit_info))
+
         # handle obj_aux
         obj_aux_def = self.init_asset["obj_aux_def"]
         for obj_aux_id, obj_def_item in obj_aux_def.items():
@@ -307,121 +377,6 @@ class EnvGeneral(VecTask):
                 "num_actuator": self.gym.get_asset_actuator_count(current_asset),
                 "num_tendon": self.gym.get_asset_tendon_count(current_asset),
             }
-
-        # load agents
-        # TODO: general multi-agent
-        self.lh_enabled, self.rh_enabled = self.init_asset["lh_def"] is not None, self.init_asset["rh_def"] is not None
-        self.num_agents = int(self.lh_enabled) + int(self.rh_enabled)
-        if self.lh_enabled:
-            lh_asset_options = gymapi.AssetOptions()
-            lh_asset_options.flip_visual_attachments = False
-            lh_asset_options.fix_base_link = self.init_asset["lh_def"]["static"]
-            lh_asset_options.disable_gravity = True
-            lh_asset_options.collapse_fixed_joints = False
-            lh_asset_options.thickness = self.init_asset["lh_def"].get("thickness", 0.001)
-            if self.init_asset[f"lh_def"].get("cata", None) == "shadowhand_no_forearm":
-                lh_asset_options.angular_damping = 100
-                lh_asset_options.linear_damping = 100
-                lh_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-
-            geom_param_lh = self.init_asset["lh_def"]["geom_param"]
-            asset_lh = self.gym.load_asset(
-                self.sim, geom_param_lh["asset_dir"], geom_param_lh["asset_name"], lh_asset_options
-            )
-            self.meta_info["lh"] = {
-                "num_body": self.gym.get_asset_rigid_body_count(asset_lh),
-                "num_shape": self.gym.get_asset_rigid_shape_count(asset_lh),
-                "num_dof": self.gym.get_asset_dof_count(asset_lh),
-                "num_actuator": self.gym.get_asset_actuator_count(asset_lh),
-                "num_tendon": self.gym.get_asset_tendon_count(asset_lh),
-            }
-
-            # tendon
-            if self.init_asset[f"lh_def"].get("cata", None) == "shadowhand_no_forearm":
-                limit_stiffness = 30
-                t_damping = 0.1
-                relevant_tendons = ["robot0:T_FFJ1c", "robot0:T_MFJ1c", "robot0:T_RFJ1c", "robot0:T_LFJ1c"]
-                tendon_props = self.gym.get_asset_tendon_properties(asset_lh)
-                for i in range(self.meta_info["lh"]["num_tendon"]):
-                    for rt in relevant_tendons:
-                        if self.gym.get_asset_tendon_name(asset_lh, i) == rt:
-                            tendon_props[i].limit_stiffness = limit_stiffness
-                            tendon_props[i].damping = t_damping
-                self.gym.set_asset_tendon_properties(asset_lh, tendon_props)
-
-            # dof actutation
-            actuated_dof_name_lh = [
-                self.gym.get_asset_actuator_joint_name(asset_lh, i) for i in range(self.meta_info["lh"]["num_actuator"])
-            ]
-            actuated_dof_index_lh = [self.gym.find_asset_dof_index(asset_lh, name) for name in actuated_dof_name_lh]
-            self.meta_info["lh"]["actuated_dof_name"] = actuated_dof_name_lh
-            self.meta_info["lh"]["actuated_dof_index"] = actuated_dof_index_lh
-
-            # dof
-            asset_lh_dof_props = self.gym.get_asset_dof_properties(asset_lh)
-            self.limit_info["lh"] = {
-                "lower": np.asarray(asset_lh_dof_props["lower"]).copy().astype(np.float32),
-                "upper": np.asarray(asset_lh_dof_props["upper"]).copy().astype(np.float32),
-            }
-            self.limit_info["lh"]["default_pos"] = np.zeros_like(self.limit_info["lh"]["lower"])
-            self.limit_info["lh"]["default_vel"] = np.zeros_like(self.limit_info["lh"]["lower"])
-
-        if self.rh_enabled:
-            rh_asset_options = gymapi.AssetOptions()
-            rh_asset_options.flip_visual_attachments = False
-            rh_asset_options.fix_base_link = self.init_asset["rh_def"]["static"]
-            rh_asset_options.disable_gravity = True
-            rh_asset_options.collapse_fixed_joints = False
-            rh_asset_options.thickness = self.init_asset["rh_def"].get("thickness", 0.001)
-            if self.init_asset[f"rh_def"].get("cata", None) == "shadowhand_no_forearm":
-                rh_asset_options.angular_damping = 100
-                rh_asset_options.linear_damping = 100
-                rh_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-
-            geom_param_rh = self.init_asset["rh_def"]["geom_param"]
-            asset_rh = self.gym.load_asset(
-                self.sim, geom_param_rh["asset_dir"], geom_param_rh["asset_name"], rh_asset_options
-            )
-            self.meta_info["rh"] = {
-                "num_body": self.gym.get_asset_rigid_body_count(asset_rh),
-                "num_shape": self.gym.get_asset_rigid_shape_count(asset_rh),
-                "num_dof": self.gym.get_asset_dof_count(asset_rh),
-                "num_actuator": self.gym.get_asset_actuator_count(asset_rh),
-                "num_tendon": self.gym.get_asset_tendon_count(asset_rh),
-            }
-
-            # tendon
-            if self.init_asset[f"rh_def"].get("cata", None) == "shadowhand_no_forearm":
-                limit_stiffness = 30
-                t_damping = 0.1
-                relevant_tendons = ["robot0:T_FFJ1c", "robot0:T_MFJ1c", "robot0:T_RFJ1c", "robot0:T_LFJ1c"]
-                tendon_props = self.gym.get_asset_tendon_properties(asset_rh)
-                for i in range(self.meta_info["rh"]["num_tendon"]):
-                    for rt in relevant_tendons:
-                        if self.gym.get_asset_tendon_name(asset_rh, i) == rt:
-                            tendon_props[i].limit_stiffness = limit_stiffness
-                            tendon_props[i].damping = t_damping
-                self.gym.set_asset_tendon_properties(asset_rh, tendon_props)
-
-            # dof actutation
-            actuated_dof_name_rh = [
-                self.gym.get_asset_actuator_joint_name(asset_rh, i) for i in range(self.meta_info["rh"]["num_actuator"])
-            ]
-            actuated_dof_index_rh = [self.gym.find_asset_dof_index(asset_rh, name) for name in actuated_dof_name_rh]
-            self.meta_info["rh"]["actuated_dof_name"] = actuated_dof_name_rh
-            self.meta_info["rh"]["actuated_dof_index"] = actuated_dof_index_rh
-
-            # dof
-            asset_rh_dof_props = self.gym.get_asset_dof_properties(asset_rh)
-            self.limit_info["rh"] = {
-                "lower": np.asarray(asset_rh_dof_props["lower"]).copy().astype(np.float32),
-                "upper": np.asarray(asset_rh_dof_props["upper"]).copy().astype(np.float32),
-            }
-            self.limit_info["rh"]["default_pos"] = np.zeros_like(self.limit_info["rh"]["lower"])
-            self.limit_info["rh"]["default_vel"] = np.zeros_like(self.limit_info["rh"]["lower"])
-
-        _logger.info("meta_info: \n%s" % pformat(self.meta_info))
-        _logger.info("limit_info: \n%s" % pformat(self.limit_info))
 
         # load envs
         if self.up_axis == "z":
@@ -451,29 +406,127 @@ class EnvGeneral(VecTask):
         self.dof_count_list = []
         self.dof_index_begin_list = []
 
-        self.env_rb_count_store = []
-        self.env_rb_index_store = []
-        self.env_rb_index_map_store = []  # allow index by link name
-        self.rb_count_list = []
-        self.rb_index_begin_list = []
+        self.env_rb_count_store = []  # each env, each actor, rb count
+        self.env_rb_index_store = []  # each env, each actor, rb index arr (local)
+        self.env_rb_index_map_store = []  # each env, each actor, rb index by link name (local)
+        self.rb_count_list = []  # each env, rb count
+        self.rb_index_begin_list = []  # each env, rb index begin
+
+        self.env_force_sensor_count_store = []  # each env, each actor, fs count
+        self.env_force_sensor_index_store = []  # each env, each actor, fs index arr (local)
+        self.force_sensor_count_list = []  # each env, fs count
+        self.force_sensor_index_begin_list = []  # each env, fs index begin
 
         dof_front = 0
         rb_front = 0
+        fs_front = 0
         for env_id in range(self.num_envs):
             # create env instance
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
 
             # get handle of current env asset
             env_asset = self.init_asset["env_info"][env_id]
+            if self.aggregate_mode >= 1:
+                _agg_num_body, _agg_num_shape = determine_aggregate_info(self.meta_info, env_asset)
+                self.gym.begin_aggregate(env_ptr, _agg_num_body, _agg_num_shape, True)
             _curr_dof_count = {}
             _curr_rb_count, _curr_rb_index_map = {}, {}
+            _curr_fs_count = {}
+
+            # agent
+            for h_id in ["lh", "rh"]:
+                if not self.h_enabled[h_id]:
+                    continue
+                h_info = env_asset[f"{h_id}_info"]
+                h_tsl = h_info["tsl"]
+                h_quat = h_info["quat"]
+                h_actor = self.gym.create_actor(
+                    env_ptr,
+                    asset_h,
+                    gymapi.Transform(
+                        p=gymapi.Vec3(h_tsl[0], h_tsl[1], h_tsl[2]),
+                        r=gymapi.Quat(h_quat[1], h_quat[2], h_quat[3], h_quat[0]),
+                    ),
+                    h_id,
+                    env_id,
+                    env_asset[f"{h_id}_info"]["collision_filter"],
+                )
+                h_dof_props = self.gym.get_actor_dof_properties(env_ptr, h_actor)
+                if self.init_asset[f"{h_id}_def"].get("load_context", None):
+                    self.init_asset[f"{h_id}_def"]["load_context"].handle_actor_drive(h_dof_props, self.meta_info[h_id])
+                self.gym.set_actor_dof_properties(env_ptr, h_actor, h_dof_props)
+                # friction
+                h_shape_props = self.gym.get_actor_rigid_shape_properties(env_ptr, h_actor)
+                for _shape_props in h_shape_props:
+                    _shape_props.friction = 1
+                self.gym.set_actor_rigid_shape_properties(env_ptr, h_actor, h_shape_props)
+                # color
+                for _o in range(self.meta_info[h_id]["num_body"]):
+                    self.gym.set_rigid_body_color(
+                        env_ptr, h_actor, _o, gymapi.MESH_VISUAL, gymapi.Vec3(*self.hand_color)
+                    )
+
+                h_index = self.gym.get_actor_index(env_ptr, h_actor, gymapi.DOMAIN_SIM)
+                h_dof_count = self.gym.get_actor_dof_count(env_ptr, h_actor)
+                _curr_dof_count[h_id] = h_dof_count
+
+                h_rb_count = self.gym.get_actor_rigid_body_count(env_ptr, h_actor)
+                h_rb_dict = self.gym.get_actor_rigid_body_dict(env_ptr, h_actor)
+                _curr_rb_count[h_id] = h_rb_count
+                _curr_rb_index_map[h_id] = dict(sorted(h_rb_dict.items(), key=lambda item: item[1]))
+
+                h_fs_count = self.gym.get_actor_force_sensor_count(env_ptr, h_actor)
+                if h_fs_count > 0:
+                    _curr_fs_count[h_id] = h_fs_count
+
+                # store index
+                if h_id == "lh":
+                    self.lh_actor_list.append(h_actor)
+                    self.lh_index_arr.append(h_index)
+                else:  # h_id == "rh":
+                    self.rh_actor_list.append(h_actor)
+                    self.rh_index_arr.append(h_index)
+
+            # obj
+            _curr_obj_actor = {}
+            _curr_obj_index = {}
+            for obj_info in env_asset["obj_info"]:
+                obj_actor, obj_index = self._create_obj_actor(
+                    env_ptr,
+                    env_id,
+                    obj_info,
+                    asset_store_obj[obj_info["id"]],
+                    obj_def[obj_info["id"]],
+                )
+                obj_shape_props = self.gym.get_actor_rigid_shape_properties(env_ptr, obj_actor)
+                for _shape_props in obj_shape_props:
+                    _shape_props.friction = 1
+                self.gym.set_actor_rigid_shape_properties(env_ptr, obj_actor, obj_shape_props)
+                obj_dof_count = self.gym.get_actor_dof_count(env_ptr, obj_actor)
+                _curr_obj_actor[obj_info["id"]] = obj_actor
+                _curr_obj_index[obj_info["id"]] = obj_index
+                if obj_dof_count > 0:
+                    _curr_dof_count[obj_info["id"]] = obj_dof_count
+                obj_rb_count = self.gym.get_actor_rigid_body_count(env_ptr, obj_actor)
+                obj_rb_dict = self.gym.get_actor_rigid_body_dict(env_ptr, obj_actor)
+                _curr_rb_count[obj_info["id"]] = obj_rb_count
+                _curr_rb_index_map[obj_info["id"]] = dict(sorted(obj_rb_dict.items(), key=lambda item: item[1]))
+                obj_fs_count = self.gym.get_actor_force_sensor_count(env_ptr, obj_actor)
+                if obj_fs_count > 0:
+                    _curr_fs_count[obj_info["id"]] = obj_fs_count
+            self.obj_actor_store.append(_curr_obj_actor)
+            self.obj_index_store.append(_curr_obj_index)
 
             # obj_aux
             _curr_obj_aux_actor = {}
             _curr_obj_aux_index = {}
             for obj_aux_info in env_asset["obj_info_aux"]:
                 obj_aux_actor, obj_aux_index = self._create_obj_actor(
-                    env_ptr, env_id, obj_aux_info, asset_store_obj_aux
+                    env_ptr,
+                    env_id,
+                    obj_aux_info,
+                    asset_store_obj_aux[obj_aux_info["id"]],
+                    obj_aux_def[obj_aux_info["id"]],
                 )
                 obj_aux_dof_count = self.gym.get_actor_dof_count(env_ptr, obj_aux_actor)
                 _curr_obj_aux_actor[obj_aux_info["id"]] = obj_aux_actor
@@ -484,111 +537,11 @@ class EnvGeneral(VecTask):
                 obj_aux_rb_dict = self.gym.get_actor_rigid_body_dict(env_ptr, obj_aux_actor)
                 _curr_rb_count[obj_aux_info["id"]] = obj_aux_rb_count
                 _curr_rb_index_map[obj_aux_info["id"]] = dict(sorted(obj_aux_rb_dict.items(), key=lambda item: item[1]))
+                obj_aux_fs_count = self.gym.get_actor_force_sensor_count(env_ptr, obj_aux_actor)
+                if obj_aux_fs_count > 0:
+                    _curr_fs_count[obj_aux_info["id"]] = obj_aux_fs_count
             self.obj_aux_actor_store.append(_curr_obj_aux_actor)
             self.obj_aux_index_store.append(_curr_obj_aux_index)
-
-            # obj
-            _curr_obj_actor = {}
-            _curr_obj_index = {}
-            for obj_info in env_asset["obj_info"]:
-                obj_actor, obj_index = self._create_obj_actor(env_ptr, env_id, obj_info, asset_store_obj)
-                self.gym.set_rigid_body_color(env_ptr, obj_actor, 0, gymapi.MESH_VISUAL, gymapi.Vec3(*self.object_color))
-                obj_dof_count = self.gym.get_actor_dof_count(env_ptr, obj_actor)
-                _curr_obj_actor[obj_info["id"]] = obj_actor
-                _curr_obj_index[obj_info["id"]] = obj_index
-                if obj_dof_count > 0:
-                    _curr_dof_count[obj_info["id"]] = obj_dof_count
-                obj_rb_count = self.gym.get_actor_rigid_body_count(env_ptr, obj_actor)
-                obj_rb_dict = self.gym.get_actor_rigid_body_dict(env_ptr, obj_actor)
-                _curr_rb_count[obj_info["id"]] = obj_rb_count
-                _curr_rb_index_map[obj_info["id"]] = dict(sorted(obj_rb_dict.items(), key=lambda item: item[1]))
-            self.obj_actor_store.append(_curr_obj_actor)
-            self.obj_index_store.append(_curr_obj_index)
-
-            # agent
-            stiffness = 1.00  # TODO: move to const
-            damping = 0.10
-            hand_friction = 1.0  # TODO: This is the default value; need way to specify this value in asset creation
-            obj_friction = 1.0
-            if self.lh_enabled:
-                lh_info = env_asset["lh_info"]
-                lh_tsl = lh_info["tsl"]
-                lh_quat = lh_info["quat"]
-                lh_actor = self.gym.create_actor(
-                    env_ptr,
-                    asset_lh,
-                    gymapi.Transform(
-                        p=gymapi.Vec3(lh_tsl[0], lh_tsl[1], lh_tsl[2]),
-                        r=gymapi.Quat(lh_quat[1], lh_quat[2], lh_quat[3], lh_quat[0]),
-                    ),
-                    "lh",
-                    env_id,
-                    env_asset["lh_info"]["collision_filter"],
-                )
-                lh_dof_props = self.gym.get_actor_dof_properties(env_ptr, lh_actor)
-                if self.init_asset[f"lh_def"].get("cata", None) == "mano":
-                    lh_dof_props["driveMode"].fill(gymapi.DOF_MODE_POS)
-                    lh_dof_props["stiffness"].fill(stiffness)
-                    lh_dof_props["damping"].fill(damping)
-                elif self.init_asset[f"lh_def"].get("cata", None) == "shadowhand_no_forearm":
-                    _lh_drive = (lh_dof_props["driveMode"] == gymapi.DOF_MODE_POS)
-                    lh_dof_props["stiffness"][_lh_drive] *= 10
-                    lh_dof_props["effort"][_lh_drive] *= 10
-                self.gym.set_actor_dof_properties(env_ptr, lh_actor, lh_dof_props)
-                for _o in range(self.meta_info["lh"]["num_body"]):
-                    self.gym.set_rigid_body_color(
-                        env_ptr, lh_actor, _o, gymapi.MESH_VISUAL, gymapi.Vec3(*self.hand_color)
-                    )
-
-                lh_index = self.gym.get_actor_index(env_ptr, lh_actor, gymapi.DOMAIN_SIM)
-                lh_dof_count = self.gym.get_actor_dof_count(env_ptr, lh_actor)
-                _curr_dof_count["lh"] = lh_dof_count
-                lh_rb_count = self.gym.get_actor_rigid_body_count(env_ptr, lh_actor)
-                lh_rb_dict = self.gym.get_actor_rigid_body_dict(env_ptr, lh_actor)
-                _curr_rb_count["lh"] = lh_rb_count
-                _curr_rb_index_map["lh"] = dict(sorted(lh_rb_dict.items(), key=lambda item: item[1]))
-                self.lh_actor_list.append(lh_actor)
-                self.lh_index_arr.append(lh_index)
-
-            if self.rh_enabled:
-                rh_info = env_asset["rh_info"]
-                rh_tsl = rh_info["tsl"]
-                rh_quat = rh_info["quat"]
-                rh_actor = self.gym.create_actor(
-                    env_ptr,
-                    asset_rh,
-                    gymapi.Transform(
-                        p=gymapi.Vec3(rh_tsl[0], rh_tsl[1], rh_tsl[2]),
-                        r=gymapi.Quat(rh_quat[1], rh_quat[2], rh_quat[3], rh_quat[0]),
-                    ),
-                    "rh",
-                    env_id,
-                    env_asset["rh_info"]["collision_filter"],
-                )
-                rh_dof_props = self.gym.get_actor_dof_properties(env_ptr, rh_actor)
-                if self.init_asset[f"rh_def"].get("cata", None) == "mano":
-                    rh_dof_props["driveMode"].fill(gymapi.DOF_MODE_POS)
-                    rh_dof_props["stiffness"].fill(stiffness)
-                    rh_dof_props["damping"].fill(damping)
-                elif self.init_asset[f"rh_def"].get("cata", None) == "shadowhand_no_forearm":
-                    _rh_drive = (rh_dof_props["driveMode"] == gymapi.DOF_MODE_POS)
-                    rh_dof_props["stiffness"][_rh_drive] *= 10
-                    rh_dof_props["effort"][_rh_drive] *= 10
-                self.gym.set_actor_dof_properties(env_ptr, rh_actor, rh_dof_props)
-                for _o in range(self.meta_info["rh"]["num_body"]):
-                    self.gym.set_rigid_body_color(
-                        env_ptr, rh_actor, _o, gymapi.MESH_VISUAL, gymapi.Vec3(*self.hand_color)
-                    )
-
-                rh_index = self.gym.get_actor_index(env_ptr, rh_actor, gymapi.DOMAIN_SIM)
-                rh_dof_count = self.gym.get_actor_dof_count(env_ptr, rh_actor)
-                _curr_dof_count["rh"] = rh_dof_count
-                rh_rb_count = self.gym.get_actor_rigid_body_count(env_ptr, rh_actor)
-                rh_rb_dict = self.gym.get_actor_rigid_body_dict(env_ptr, rh_actor)
-                _curr_rb_count["rh"] = rh_rb_count
-                _curr_rb_index_map["rh"] = dict(sorted(rh_rb_dict.items(), key=lambda item: item[1]))
-                self.rh_actor_list.append(rh_actor)
-                self.rh_index_arr.append(rh_index)
 
             _curr_dof_index = _dof_count_to_index(_curr_dof_count)
             _curr_dof_num = sum(_curr_dof_count.values())
@@ -607,28 +560,46 @@ class EnvGeneral(VecTask):
             self.rb_index_begin_list.append(rb_front)
             rb_front += _curr_rb_num
 
+            _curr_fs_index = _dof_count_to_index(_curr_fs_count)
+            _curr_fs_num = sum(_curr_fs_count.values())
+            self.env_force_sensor_count_store.append(_curr_fs_count)
+            self.env_force_sensor_index_store.append(_curr_fs_index)
+            self.force_sensor_count_list.append(_curr_fs_num)
+            self.force_sensor_index_begin_list.append(fs_front)
+            fs_front += _curr_fs_num
+
+            if self.aggregate_mode > 0:
+                self.gym.end_aggregate(env_ptr)
+
             # record env
             self.env_list.append(env_ptr)
 
         self.lh_index_arr = (
-            to_torch(self.lh_index_arr, dtype=torch.long, device=self.device) if self.lh_enabled else None
+            torch.as_tensor(self.lh_index_arr, dtype=torch.long, device=self.device) if self.lh_enabled else None
         )
         self.rh_index_arr = (
-            to_torch(self.rh_index_arr, dtype=torch.long, device=self.device) if self.rh_enabled else None
+            torch.as_tensor(self.rh_index_arr, dtype=torch.long, device=self.device) if self.rh_enabled else None
         )
 
         # extract init info
         self.init_info = _extract_init_info(self.init_asset)
+
+        # env specific
+        self.init_with_random_time = self.cfg_env.get("init_with_random_time", False)
 
     def _create_asset(self, obj_def_item):
         asset_options = gymapi.AssetOptions()
         asset_options.override_com = True
         asset_options.override_inertia = True
         asset_options.mesh_normal_mode = gymapi.COMPUTE_PER_VERTEX
-        asset_options.density = obj_def_item.get("density", 990)
+        asset_options.density = obj_def_item.get("density", 550)
         asset_options.thickness = obj_def_item.get("thickness", 0.001)
         if obj_def_item["static"]:
             asset_options.fix_base_link = True
+        
+        if obj_def_item.get("disable_gravity", False):
+            asset_options.disable_gravity = True
+        
         if obj_def_item.get("vhacd", False):
             asset_options.vhacd_enabled = True
             asset_options.vhacd_params = gymapi.VhacdParams()
@@ -641,6 +612,9 @@ class EnvGeneral(VecTask):
         if obj_def_item["geom_cata"] == GeomCata.BOX:
             _w, _h, _d = obj_def_item["geom_param"]["dim"]
             current_asset = self.gym.create_box(self.sim, _w, _h, _d, asset_options)
+        elif obj_def_item["geom_cata"] == GeomCata.SPHERE:
+            _r = obj_def_item["geom_param"]["radius"]
+            current_asset = self.gym.create_sphere(self.sim, _r, asset_options)
         elif obj_def_item["geom_cata"] == GeomCata.URDF:
             _dir = obj_def_item["geom_param"]["asset_dir"]
             _name = obj_def_item["geom_param"]["asset_name"]
@@ -648,7 +622,7 @@ class EnvGeneral(VecTask):
 
         return current_asset
 
-    def _create_obj_actor(self, env_ptr, env_id, obj_info, asset_store):
+    def _create_obj_actor(self, env_ptr, env_id, obj_info, current_asset, current_obj_def):
         obj_dof_damping = 0.10  # TODO
         obj_dof_stiffness = 0.00  # TODO
         obj_dof_friction = 0.0001
@@ -662,7 +636,8 @@ class EnvGeneral(VecTask):
         quat = rotmat_to_quat_np(obj_cur_tf[:3, :3])
         pose.r = gymapi.Quat(quat[1], quat[2], quat[3], quat[0])
 
-        current_asset = asset_store[obj_id]
+        if current_obj_def.get("no_collide", False):  # disable collide
+            env_id = env_id + self.num_envs
         obj_actor = self.gym.create_actor(env_ptr, current_asset, pose, obj_id, env_id, obj_info["collision_filter"])
         obj_index = self.gym.get_actor_index(env_ptr, obj_actor, gymapi.DOMAIN_SIM)
 
@@ -674,6 +649,10 @@ class EnvGeneral(VecTask):
             obj_dof_props["armature"].fill(obj_dof_armature)
             self.gym.set_actor_dof_properties(env_ptr, obj_actor, obj_dof_props)
 
+        if current_obj_def.get("color", None) is not None:
+            self.gym.set_rigid_body_color(
+                env_ptr, obj_actor, 0, gymapi.MESH_VISUAL, gymapi.Vec3(*current_obj_def["color"])
+            )
         return obj_actor, obj_index
 
     def set_viewer(self):
@@ -705,7 +684,7 @@ class EnvGeneral(VecTask):
             root_state_quat_xyzw_list.extend(_info["quat"][[1, 2, 3, 0]] for _info in _info_store.values())
 
             # handle hand
-            for hand_side in segment.HAND_SIDE:
+            for hand_side in ["lh", "rh"]:
                 if self.init_info[hand_side] is None:
                     continue
                 _index_arr = self.lh_index_arr if hand_side == "lh" else self.rh_index_arr
@@ -737,7 +716,7 @@ class EnvGeneral(VecTask):
                 actor_dof_pos_list.append(full_dof_pos)
 
             # handle hand
-            for hand_side in segment.HAND_SIDE:
+            for hand_side in ["lh", "rh"]:
                 if self.init_info[hand_side] is None:
                     continue
                 full_dof_index = (local_dof_index_begin + local_dof_index_store[hand_side]).tolist()
@@ -758,20 +737,20 @@ class EnvGeneral(VecTask):
                 actor_dof_pos_list.append(full_dof_pos)
 
         ## root_state
-        obj_index_flat = torch.as_tensor(
+        root_state_index_flat = torch.as_tensor(
             np.array(root_state_index_list, dtype=np.int64), dtype=torch.long, device=self.device
         )
         tsl_arr_flat = torch.as_tensor(np.stack(root_state_tsl_list, axis=0), dtype=torch.float32, device=self.device)
         quat_xyzw_arr_flat = torch.as_tensor(
             np.stack(root_state_quat_xyzw_list, axis=0), dtype=torch.float32, device=self.device
         )
-        self.root_state[obj_index_flat, 0:3] = tsl_arr_flat
-        self.root_state[obj_index_flat, 3:7] = quat_xyzw_arr_flat
-        self.root_state[obj_index_flat, 7:13] = torch.zeros(
-            (len(obj_index_flat), 6), dtype=torch.float32, device=self.device
+        self.root_state[root_state_index_flat, 0:3] = tsl_arr_flat
+        self.root_state[root_state_index_flat, 3:7] = quat_xyzw_arr_flat
+        self.root_state[root_state_index_flat, 7:13] = torch.zeros(
+            (len(root_state_index_flat), 6), dtype=torch.float32, device=self.device
         )
         # clear root_state_init too
-        self.root_state_init[obj_index_flat, :] = self.root_state[obj_index_flat, :].detach().clone()
+        self.root_state_init[root_state_index_flat, :] = self.root_state[root_state_index_flat, :].detach().clone()
 
         ## dof_pos
         actor_index_arr = torch.as_tensor(
@@ -787,7 +766,7 @@ class EnvGeneral(VecTask):
         self.dof_state_init[actor_dof_index_flat, :] = self.dof_state[actor_dof_index_flat, :].detach().clone()
 
         # apply
-        _index = torch.cat((obj_index_flat,), dim=0).to(torch.int32)
+        _index = torch.cat((root_state_index_flat,), dim=0).to(torch.int32)
         _n_index = len(_index)
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
@@ -805,13 +784,20 @@ class EnvGeneral(VecTask):
         )
 
         # update buf
-        self.progress_buf[env_id_to_reset] = 0
+        if self.init_with_random_time:
+            self.init_with_random_time = False
+            self.progress_buf[env_id_to_reset] = torch.randint(
+                0, self.max_episode_length, (len(env_id_to_reset),), device=self.device
+            )
+        else:
+            self.progress_buf[env_id_to_reset] = 0
         self.reset_buf[env_id_to_reset] = 0
 
     def pre_physics_step(self, actions: torch.Tensor):
         env_id_to_reset = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_id_to_reset) > 0:
             self.reset_idx(env_id_to_reset)
+            self.env_callback_ctx.reset_idx(env_id_to_reset)
 
         self.actions = actions.clone().to(self.device)
 
@@ -845,3 +831,32 @@ class EnvGeneral(VecTask):
     def compute_observation(self):
         if self.env_callback_ctx is not None:
             self.env_callback_ctx.compute_observation()
+
+def determine_aggregate_info(meta_info, env_asset):
+    candidate_list = []
+  
+    obj_aux_info_store = env_asset["obj_info_aux"]
+    if obj_aux_info_store is not None:
+        for info_item in obj_aux_info_store:
+            item_id = info_item["id"]
+            candidate_list.append(item_id)
+    
+    obj_info_store = env_asset["obj_info"]
+    if obj_info_store is not None:
+        for info_item in obj_info_store:
+            item_id = info_item["id"]
+            candidate_list.append(item_id)
+    
+    if env_asset["rh_info"] is not None:
+        candidate_list.append("rh")
+
+    if env_asset["lh_info"] is not None:
+        candidate_list.append("lh")
+
+    num_body, num_shape = 0, 0
+    for item_id in candidate_list:
+        meta_item = meta_info[item_id]
+        num_body += meta_item["num_body"]
+        num_shape += meta_item["num_shape"]
+
+    return num_body, num_shape

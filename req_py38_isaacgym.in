@@ -11,6 +11,8 @@ pyglet<2 # required by trimesh scene
 trimesh[easy]
 jinja2
 pymeshlab
+open3d
+cython
 # sim
 pybullet
 mujoco
