@@ -9,7 +9,6 @@ import random
 import json
 import open3d as o3d
 
-
 import logging
 from dev_fn.upkeep import log
 from dev_fn.util.console_io import RedirectStream
@@ -47,13 +46,13 @@ def main():
     num_envs = 100
     random.seed(0)
 
-    with open("asset/oi2_dev/pour/task_list_rh__train.json", "r") as ifs:
+    with open("asset/oi2_dev/pour_eval/task_list_rh__test.json", "r") as ifs:
         code_list = json.load(ifs)
     task_info_list = []
     for code in code_list:
         task_info_list.append(
             {
-                "primitive": "pour",
+                "primitive": "pour_eval",
                 "code": code,
             }
         )
