@@ -7,6 +7,9 @@
 1. Setup asset files.
 
     Download tarballs from [huggingface](https://huggingface.co/kelvin34501/OakInk2-SimEnv-IsaacGym-Asset/blob/main/oi2_dev.tar.xz). Extract the tarball under `asset/`.
+
+    For evaluation, download [obj_interior.tar.xz]() and [pour_eval.tar.xz](https://huggingface.co/kelvin34501/OakInk2-SimEnv-IsaacGym-Asset/blob/main/pour_eval.tar.xz), and extract them under `asset/oi2_dev`.
+
     The directory structure:
     ```
     asset
@@ -15,11 +18,15 @@
     |   |--- obj
     |   |--- obj_raw
     |   |--- obj_interior
-    |   `--- pour
-    |       |--- demo_raw
+    |   |--- pour
+    |   |   |--- demo_raw
+    |   |   |--- meta
+    |   |   |--- ref_raw
+    |   |   `--- task_list_rh__train.json
+    |   `--- pour_eval
     |       |--- meta
     |       |--- ref_raw
-    |       `--- task_list_rh__train.json
+    |       `--- task_list_rh__test.json
     `--- shadowhand_no_forearm
     ```
 
